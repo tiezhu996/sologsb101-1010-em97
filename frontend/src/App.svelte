@@ -28,6 +28,10 @@
   const unqualifiedCount = $derived($pointList.filter((point) => !isQualified(point.measuredOhm, point.limitOhm)).length)
   const rate = $derived(qualifyRate($pointList.map((point) => isQualified(point.measuredOhm, point.limitOhm))))
   const pendingRectify = $derived($rectifyList.filter((rectify) => rectify.state !== '已复检').length)
+  /** 待复测 + 需补充：仪器校准更正后的待办量，作为仪器页导航徽标 */
+  const evidenceAttention = $derived(
+    $pointList.filter((point) => point.evidenceState === '待复测' || point.evidenceState === '需补充').length
+  )
 
   /** 导航高亮：根路径也算建筑物台账 */
   function isActive(path: string): boolean {
@@ -63,6 +67,8 @@
             <em class="app-nav__badge">{$buildingList.length}</em>
           {:else if item.path === '/devices'}
             <em class="app-nav__badge">{$deviceList.length}</em>
+          {:else if item.path === '/meters'}
+            <em class="app-nav__badge">{evidenceAttention}</em>
           {:else if item.path === '/points'}
             <em class="app-nav__badge">{pointCount}</em>
           {:else if item.path === '/verdicts'}

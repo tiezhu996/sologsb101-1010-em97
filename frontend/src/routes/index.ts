@@ -14,6 +14,7 @@
 import type { Component } from 'svelte'
 import BuildingList from './BuildingList.svelte'
 import DeviceList from './DeviceList.svelte'
+import MeterList from './MeterList.svelte'
 import PointEntry from './PointEntry.svelte'
 import VerdictBoard from './VerdictBoard.svelte'
 import BackupView from './BackupView.svelte'
@@ -38,6 +39,7 @@ export const routes: AppRoute[] = [
   { path: '/', component: HomeRedirect as unknown as PageComponent },
   { path: HOME_PATH, component: BuildingList as unknown as PageComponent },
   { path: '/devices', component: DeviceList as unknown as PageComponent },
+  { path: '/meters', component: MeterList as unknown as PageComponent },
   { path: '/points', component: PointEntry as unknown as PageComponent },
   { path: '/verdicts', component: VerdictBoard as unknown as PageComponent },
   { path: '/backup', component: BackupView as unknown as PageComponent },

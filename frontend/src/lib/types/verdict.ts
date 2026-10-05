@@ -3,21 +3,25 @@ export type VerdictResult = '合格' | '不合格' | '待判定'
 
 export const VERDICT_RESULTS: VerdictResult[] = ['合格', '不合格', '待判定']
 
-/** 判定：实测值与限值比对后的结论，检测人确认后生效 */
+/** 判定：实测值与限值比对后的结论，检测人确认（签发）后生效并锁定 */
 export interface Verdict {
   id: string
   /** 被判定的测点 */
   pointId: string
   /** 判定结论 */
   result: VerdictResult
-  /** 判定依据（规范条款 / 限值来源） */
+  /** 判定依据（规范条款 / 限值来源），签发后保留原依据不再改动 */
   basis: string
   /** 检测人 */
   inspector: string
   /** 判定日期 */
   verdictDate: string
-  /** 是否已由检测人确认生效 */
+  /** 是否已由检测人确认生效（确认即签发，签发后结论锁定） */
   confirmed: boolean
+  /** 签发时间戳：确认生效时写入，未签发为 null */
+  issuedAt: number | null
+  /** 校准记录更正波及已签发结论时置 true：保留原依据，提示需要补充 */
+  needsSupplement: boolean
   createdAt: number
   updatedAt: number
 }

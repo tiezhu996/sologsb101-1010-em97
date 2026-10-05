@@ -15,6 +15,7 @@ export interface NavItem {
 export const NAV_ITEMS: NavItem[] = [
   { path: '/buildings', label: '建筑物台账', badgeHint: '建筑物数量' },
   { path: '/devices', label: '防雷装置登记', badgeHint: '防雷装置数量' },
+  { path: '/meters', label: '仪器与校准', badgeHint: '待复测与需补充数量' },
   { path: '/points', label: '接地电阻测点', badgeHint: '测点数量' },
   { path: '/verdicts', label: '合格判定与整改', badgeHint: '不合格测点数量' },
   { path: '/backup', label: '结论与备份', badgeHint: '数据备份' }

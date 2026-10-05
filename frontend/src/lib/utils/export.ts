@@ -1,6 +1,7 @@
 /**
  * 备份导入导出：整库 JSON 快照的组装、校验、下载与导入。
  * 与 utils/db.ts 的 BackupPayload 结构保持一致；JSON 中不含任何非数据内容。
+ * 测点证据状态（有效 / 待复测 / 待补证 / 需补充）随快照一同导出导入，不丢失。
  */
 import {
   db,
@@ -11,18 +12,25 @@ import {
   stampBackupTime,
   type BackupPayload
 } from '$lib/utils/db'
+import type { Calibration, Meter } from '$lib/types/meter'
+import type { Point } from '$lib/types/point'
+import { EVIDENCE_STATES } from '$lib/types/point'
+import type { Verdict } from '$lib/types/verdict'
+import { resolveLegacyEvidence } from '$lib/utils/evidence'
 
 /** 备份集合键名 */
-export const BACKUP_KEYS = ['buildings', 'devices', 'points', 'verdicts', 'rectifies'] as const
+export const BACKUP_KEYS = ['buildings', 'devices', 'meters', 'calibrations', 'points', 'verdicts', 'rectifies'] as const
 export type BackupKey = (typeof BACKUP_KEYS)[number]
 
 export type CountMap = Record<BackupKey, number>
 
 /** 组装当前本地数据的完整快照 */
 export async function buildBackupPayload(): Promise<BackupPayload> {
-  const [buildings, devices, points, verdicts, rectifies] = await Promise.all([
+  const [buildings, devices, meters, calibrations, points, verdicts, rectifies] = await Promise.all([
     db.buildings.toArray(),
     db.devices.toArray(),
+    db.meters.toArray(),
+    db.calibrations.toArray(),
     db.points.toArray(),
     db.verdicts.toArray(),
     db.rectifies.toArray()
@@ -33,13 +41,15 @@ export async function buildBackupPayload(): Promise<BackupPayload> {
     exportedAt: new Date().toISOString(),
     buildings,
     devices,
+    meters,
+    calibrations,
     points,
     verdicts,
     rectifies
   }
 }
 
-/** 校验外部 JSON 是否为本站可识别的备份文件 */
+/** 校验外部 JSON 是否为本站可识别的备份文件（旧版无仪器表也可导入，按待补证规则规范化） */
 export function validateBackup(input: unknown): { ok: boolean; errors: string[]; payload: BackupPayload | null } {
   const errors: string[] = []
   if (typeof input !== 'object' || input === null) {
@@ -49,8 +59,13 @@ export function validateBackup(input: unknown): { ok: boolean; errors: string[];
   if (obj.app !== undefined && obj.app !== 'gblightprot') {
     errors.push('app 字段应为 gblightprot，文件来源不明')
   }
-  for (const key of BACKUP_KEYS) {
+  // buildings / devices / points / verdicts / rectifies 为必需；meters / calibrations 为 v3 新增，旧文件可缺省
+  const required: BackupKey[] = ['buildings', 'devices', 'points', 'verdicts', 'rectifies']
+  for (const key of required) {
     if (!Array.isArray(obj[key])) errors.push(`${key} 字段缺失或不是数组`)
+  }
+  for (const key of ['meters', 'calibrations'] as const) {
+    if (obj[key] !== undefined && !Array.isArray(obj[key])) errors.push(`${key} 字段不是数组`)
   }
   if (errors.length > 0) return { ok: false, errors, payload: null }
   const payload: BackupPayload = {
@@ -59,6 +74,8 @@ export function validateBackup(input: unknown): { ok: boolean; errors: string[];
     exportedAt: typeof obj.exportedAt === 'string' ? obj.exportedAt : new Date().toISOString(),
     buildings: obj.buildings ?? [],
     devices: obj.devices ?? [],
+    meters: obj.meters ?? [],
+    calibrations: obj.calibrations ?? [],
     points: obj.points ?? [],
     verdicts: obj.verdicts ?? [],
     rectifies: obj.rectifies ?? []
@@ -71,6 +88,8 @@ export function countPayload(payload: BackupPayload): CountMap {
   return {
     buildings: payload.buildings.length,
     devices: payload.devices.length,
+    meters: payload.meters.length,
+    calibrations: payload.calibrations.length,
     points: payload.points.length,
     verdicts: payload.verdicts.length,
     rectifies: payload.rectifies.length
@@ -106,23 +125,105 @@ export function readFileText(file: File): Promise<string> {
   })
 }
 
-/** 导入快照：overwrite=true 先清空全部表，否则按主键合并 */
-export async function importBackup(payload: BackupPayload, overwrite: boolean): Promise<CountMap> {
-  if (overwrite) await clearAllTables()
-  await db.transaction('rw', [db.buildings, db.devices, db.points, db.verdicts, db.rectifies], async () => {
-    await db.buildings.bulkPut(payload.buildings)
-    await db.devices.bulkPut(payload.devices)
-    await db.points.bulkPut(payload.points)
-    await db.verdicts.bulkPut(payload.verdicts)
-    await db.rectifies.bulkPut(payload.rectifies)
+/**
+ * 规范化导入快照：
+ * - 新版数据：测点证据状态与快照字段原样保留（导入导出不丢状态）
+ * - 旧版数据（v2 及以前，测点只有 meter 自由文本）：解析出仪器编号的重建台账与校准占位记录，
+ *   缺少仪器编号的测点归入待补证
+ * - 判定记录补齐签发时间与需补充标记
+ */
+export function normalizePayload(payload: BackupPayload): BackupPayload {
+  const now = Date.now()
+  const meters: Meter[] = payload.meters.map((meter, index) => ({
+    ...meter,
+    state: meter.state ?? '在用',
+    createdAt: meter.createdAt ?? now + index,
+    updatedAt: meter.updatedAt ?? now + index
+  }))
+  const calibrations: Calibration[] = payload.calibrations.map((calibration, index) => ({
+    ...calibration,
+    revision: calibration.revision ?? 0,
+    createdAt: calibration.createdAt ?? now + index,
+    updatedAt: calibration.updatedAt ?? now + index
+  }))
+
+  // 旧版测点：有 meter 自由文本而没有证据状态的，走统一旧数据解析
+  const legacyRows: Array<{ id: string; meter: string }> = []
+  const points = payload.points.map((point, index) => {
+    const raw = point as Point & { meter?: string }
+    const base: Point & { meter?: string } = {
+      ...raw,
+      meterId: raw.meterId ?? null,
+      meterCode: raw.meterCode ?? '',
+      meterName: raw.meterName ?? '',
+      calibrationId: raw.calibrationId ?? null,
+      calibrationValidUntil: raw.calibrationValidUntil ?? '',
+      evidenceState: raw.evidenceState ?? '待补证',
+      evidenceInvalidatedBy: raw.evidenceInvalidatedBy ?? null,
+      createdAt: raw.createdAt ?? now + index,
+      updatedAt: raw.updatedAt ?? now + index
+    }
+    if ((EVIDENCE_STATES as readonly string[]).includes(raw.evidenceState)) {
+      delete base.meter
+      return base
+    }
+    legacyRows.push({ id: raw.id, meter: typeof raw.meter === 'string' ? raw.meter : '' })
+    return base
   })
-  return countPayload(payload)
+  const legacy = resolveLegacyEvidence(legacyRows, now, { meters, calibrations })
+  const resolvedPoints = points.map((point) => {
+    const snapshot = legacy.snapshots.get(point.id)
+    if (!snapshot) {
+      const { meter: _legacyMeter, ...rest } = point as Point & { meter?: string }
+      return rest as Point
+    }
+    const { meter: _legacyMeter, ...rest } = point as Point & { meter?: string }
+    return { ...rest, ...snapshot } as Point
+  })
+
+  const verdicts: Verdict[] = payload.verdicts.map((verdict, index) => ({
+    ...verdict,
+    issuedAt: verdict.issuedAt ?? (verdict.confirmed ? (verdict.updatedAt ?? now + index) : null),
+    needsSupplement: verdict.needsSupplement ?? false,
+    createdAt: verdict.createdAt ?? now + index,
+    updatedAt: verdict.updatedAt ?? now + index
+  }))
+
+  return {
+    ...payload,
+    meters: [...meters, ...legacy.meters],
+    calibrations: [...calibrations, ...legacy.calibrations],
+    points: resolvedPoints,
+    verdicts
+  }
 }
 
-/** 追加式导入：为导入数据重新分配 id，避免覆盖现有档案 */
+/** 导入快照：overwrite=true 先清空全部表，否则按主键合并；导入前统一规范化 */
+export async function importBackup(payload: BackupPayload, overwrite: boolean): Promise<CountMap> {
+  const normalized = normalizePayload(payload)
+  if (overwrite) await clearAllTables()
+  await db.transaction(
+    'rw',
+    [db.buildings, db.devices, db.meters, db.calibrations, db.points, db.verdicts, db.rectifies],
+    async () => {
+      await db.buildings.bulkPut(normalized.buildings)
+      await db.devices.bulkPut(normalized.devices)
+      await db.meters.bulkPut(normalized.meters)
+      await db.calibrations.bulkPut(normalized.calibrations)
+      await db.points.bulkPut(normalized.points)
+      await db.verdicts.bulkPut(normalized.verdicts)
+      await db.rectifies.bulkPut(normalized.rectifies)
+    }
+  )
+  return countPayload(normalized)
+}
+
+/** 追加式导入：为导入数据重新分配 id，避免覆盖现有档案；证据状态随测点保留 */
 export function remapIds(payload: BackupPayload): BackupPayload {
   const buildingMap = new Map<string, string>()
   const deviceMap = new Map<string, string>()
+  const meterMap = new Map<string, string>()
+  const calibrationMap = new Map<string, string>()
   const pointMap = new Map<string, string>()
 
   const buildings = payload.buildings.map((building) => {
@@ -135,10 +236,36 @@ export function remapIds(payload: BackupPayload): BackupPayload {
     deviceMap.set(device.id, id)
     return { ...device, id, buildingId: buildingMap.get(device.buildingId) ?? device.buildingId }
   })
+  const meters = payload.meters.map((meter) => {
+    const id = createId('mtr')
+    meterMap.set(meter.id, id)
+    return { ...meter, id }
+  })
+  const calibrations = payload.calibrations.map((calibration) => {
+    const id = createId('cal')
+    calibrationMap.set(calibration.id, id)
+    return { ...calibration, id, meterId: meterMap.get(calibration.meterId) ?? calibration.meterId }
+  })
   const points = payload.points.map((point) => {
     const id = createId('pnt')
     pointMap.set(point.id, id)
-    return { ...point, id, deviceId: deviceMap.get(point.deviceId) ?? point.deviceId }
+    // 失效来源键 `校准记录id#revision` 随校准记录一并重映射，保持幂等键有效
+    const invalidatedBy = point.evidenceInvalidatedBy
+    const remappedInvalidatedBy = invalidatedBy
+      ? (() => {
+          const [calibrationId, revision] = invalidatedBy.split('#')
+          const mapped = calibrationMap.get(calibrationId)
+          return mapped ? `${mapped}#${revision}` : invalidatedBy
+        })()
+      : null
+    return {
+      ...point,
+      id,
+      deviceId: deviceMap.get(point.deviceId) ?? point.deviceId,
+      meterId: point.meterId ? (meterMap.get(point.meterId) ?? point.meterId) : null,
+      calibrationId: point.calibrationId ? (calibrationMap.get(point.calibrationId) ?? point.calibrationId) : null,
+      evidenceInvalidatedBy: remappedInvalidatedBy
+    }
   })
   const verdicts = payload.verdicts.map((verdict) => ({
     ...verdict,
@@ -151,7 +278,7 @@ export function remapIds(payload: BackupPayload): BackupPayload {
     buildingId: buildingMap.get(rectify.buildingId) ?? rectify.buildingId,
     pointId: rectify.pointId ? pointMap.get(rectify.pointId) ?? rectify.pointId : null
   }))
-  return { ...payload, buildings, devices, points, verdicts, rectifies }
+  return { ...payload, buildings, devices, meters, calibrations, points, verdicts, rectifies }
 }
 
 /** 检测结论行：按建筑物汇总测点数、不合格数与结论文字 */
@@ -164,6 +291,10 @@ export interface ConclusionLine {
   pointCount: number
   unqualifiedCount: number
   qualifyRatePct: number
+  /** 待复测测点数（校准更正退回、尚未复测签发） */
+  pendingRetestCount: number
+  /** 已签发但需补充的结论数（校准更正波及，原依据保留） */
+  supplementCount: number
   /** 最不利（实测/限值比最大）测点摘要 */
   worstPoint: string
   conclusion: string
@@ -183,6 +314,8 @@ export function buildConclusionLines(payload: BackupPayload): ConclusionLine[] {
       .map((point) => verdictByPoint.get(point.id))
       .filter((verdict): verdict is NonNullable<typeof verdict> => Boolean(verdict))
     const unqualified = verdicts.filter((verdict) => verdict.result === '不合格')
+    const pendingRetestCount = points.filter((point) => point.evidenceState === '待复测').length
+    const supplementCount = verdicts.filter((verdict) => verdict.confirmed && verdict.needsSupplement).length
     let worstRatio = 0
     let worstPoint = '无测点数据'
     points.forEach((point) => {
@@ -205,6 +338,9 @@ export function buildConclusionLines(payload: BackupPayload): ConclusionLine[] {
         : unqualified.length === 0
           ? `所检 ${points.length} 个测点接地电阻均不大于限值，判定合格`
           : `所检 ${points.length} 个测点中 ${unqualified.length} 个不合格，判定不合格`
+    const evidenceNotes: string[] = []
+    if (pendingRetestCount > 0) evidenceNotes.push(`${pendingRetestCount} 个测点待复测`)
+    if (supplementCount > 0) evidenceNotes.push(`${supplementCount} 条已签发结论需补充`)
     const advice =
       rectifies.length === 0
         ? '无需整改，建议按周期复测'
@@ -218,9 +354,11 @@ export function buildConclusionLines(payload: BackupPayload): ConclusionLine[] {
       pointCount: points.length,
       unqualifiedCount: unqualified.length,
       qualifyRatePct,
+      pendingRetestCount,
+      supplementCount,
       worstPoint,
       conclusion,
-      advice
+      advice: evidenceNotes.length > 0 ? `${advice}；${evidenceNotes.join('，')}` : advice
     }
   })
 }

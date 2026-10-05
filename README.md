@@ -28,10 +28,10 @@ docker compose up -d --build      # 修改代码后重新构建
 | --- | --- | --- |
 | 框架 | Svelte 5（runes：`$state` / `$derived` / `$props` / `$effect`） | 页面组件使用 `lang="ts"` |
 | 语言 | TypeScript 5.7 | 构建脚本执行 `svelte-check --tsconfig ./tsconfig.json` |
-| 路由 | svelte-spa-router 5 | hash 路由，`/buildings`、`/devices`、`/points`、`/verdicts`、`/backup` |
+| 路由 | 自建 history 路由（真实路径） | `/buildings`、`/devices`、`/meters`、`/points`、`/verdicts`、`/backup` |
 | 样式 | Tailwind CSS 4（`@tailwindcss/vite`）+ 自定义组件类 | 主题变量走 `@theme` |
-| 状态管理 | Svelte store（`writable` / `derived`） | `buildingStore`、`pointStore`、`rectifyStore` |
-| 持久化 | Dexie 4（IndexedDB，库名 `gblightprot`） | 结构版本 v2 + upgrade 迁移 + liveQuery 订阅 |
+| 状态管理 | Svelte store（`writable` / `derived`） | `buildingStore`、`meterStore`、`pointStore`、`rectifyStore` |
+| 持久化 | Dexie 4（IndexedDB，库名 `gblightprot`） | 结构版本 v3 + upgrade 迁移 + liveQuery 订阅 |
 | 构建 | Vite 6 | 产物 `dist/`，交给 nginx 托管 |
 | 容器 | node:20-alpine 构建 → nginx:alpine 运行 | 多阶段构建，运行阶段 `chmod -R a+rX` |
 
@@ -41,8 +41,9 @@ docker compose up -d --build      # 修改代码后重新构建
 | --- | --- | --- | --- |
 | `/buildings` | 建筑物与防雷类别台账 | Building、Device、Point | 新建/编辑/删除建筑物，按用途与防雷类别筛选，卡片回显装置数、测点数、不合格数与合格率 |
 | `/devices` | 接闪器/引下线/接地装置登记 | Device、Building、Point | 登记类型、材质、规格、数量与安装日期，按建筑物与类型筛选，展开查看该装置全部测点 |
-| `/points` | 接地电阻测点录入 | Point、Device | 逐点录实测电阻与限值、批量改写、批量粘贴导入（`编号,位置,实测[,限值]`） |
-| `/verdicts` | 合格判定与整改建议 | Verdict、Point、Rectify | 自动初判（实测 ≤ 限值）、检测人确认生效、批量改判、由不合格判定批量生成整改建议、整改状态机（待整改→已整改→已复检） |
+| `/meters` | 仪器台账与校准记录 | Meter、Calibration、Point、Verdict | 登记/注销仪器、登记与更正校准记录；更正后未签发测点退回待复测、已签发结论标记需补充 |
+| `/points` | 接地电阻测点录入 | Point、Device、Meter | 逐点录实测电阻与限值、批量改写、批量粘贴导入（`编号,位置,实测[,限值]`）；保存时固化仪器编号与当次校准有效期快照 |
+| `/verdicts` | 合格判定与整改建议 | Verdict、Point、Rectify | 自动初判（实测 ≤ 限值）、检测人确认签发（签发后锁定）、批量改判、待复测清单与已确认范围、整改状态机（待整改→已整改→已复检） |
 | `/backup` | 检测结论与结构版本导出 | 全部模型 | 按建筑物出检测结论、全部测点判定一览、全量 JSON 导入导出（覆盖 / 追加两种模式）、清空重建演示数据 |
 
 > 深层 id 场景：本项目的列表与明细集中在同一组路由（建筑物 → 装置 → 测点 → 判定 → 结论），不存在 `/xxx/:id/yyy` 形式的层级深链；筛选条件通过 query 传递（例如 `/points?device=dev_oil_belt`），刷新后仍可复现当前视图。若 query 指向的装置已被删除，页面自动回落到全部测点并给出空态引导，不会白屏。
@@ -72,15 +73,16 @@ sologsb101-1010/
         ├── App.svelte            # 顶部导航（link action）+ 页脚数据概览
         ├── app.css               # Tailwind 入口 + 主题变量 + 通用组件类
         ├── lib/
-        │   ├── types/            # building / device / point / verdict / rectify
-        │   ├── stores/           # buildingStore / pointStore / rectifyStore
+        │   ├── types/            # building / device / meter / point / verdict / rectify
+        │   ├── stores/           # buildingStore / meterStore / pointStore / rectifyStore
         │   ├── components/common/# QualifyTag / FilterBar / StatBadge / EmptyPanel
         │   ├── hooks/            # useIdbTable / useQualifyRate
-        │   └── utils/            # resistance.ts / db.ts / export.ts / query.ts
+        │   └── utils/            # resistance.ts / db.ts / evidence.ts / export.ts / query.ts
         └── routes/
-            ├── index.ts          # 路由表（svelte-spa-router 的 route 映射）
+            ├── index.ts          # 路由表（真实路径 → 页面组件）
             ├── BuildingList.svelte
             ├── DeviceList.svelte
+            ├── MeterList.svelte
             ├── PointEntry.svelte
             ├── VerdictBoard.svelte
             └── BackupView.svelte
@@ -98,11 +100,14 @@ npm run preview    # 预览构建产物
 
 ## 六、数据存储说明
 
-- **存储位置**：浏览器 IndexedDB，库名 `gblightprot`，当前结构版本 `v2`。所有读写经 `frontend/src/lib/utils/db.ts` 与 hooks 封装，组件不直接触碰 Dexie 实例。
-- **数据表**：`buildings`（建筑物）、`devices`（防雷装置）、`points`（接地电阻测点）、`verdicts`（合格判定）、`rectifies`（整改建议）。
-- **升级迁移**：`db.version(1)` 保留初版结构，`db.version(2).stores(...).upgrade(...)` 补齐索引并回填历史数据缺失的时间戳、限值、判定确认标记；调整字段结构时递增 `DB_VERSION` 并补迁移。
-- **首屏播种**：`initDatabase()` 在 `buildings` 表为空时执行幂等播种，生成三层互相引用的演示数据（3 栋建筑物 / 6 个防雷装置 / 9 个测点 / 9 条判定 / 2 条整改建议），其中既有合格样本也有超限样本，便于演示挂红、整改与结论导出。
+- **存储位置**：浏览器 IndexedDB，库名 `gblightprot`，当前结构版本 `v3`。所有读写经 `frontend/src/lib/utils/db.ts` 与 hooks 封装，组件不直接触碰 Dexie 实例。
+- **数据表**：`buildings`（建筑物）、`devices`（防雷装置）、`meters`（仪器台账）、`calibrations`（仪器校准记录）、`points`（接地电阻测点）、`verdicts`（合格判定）、`rectifies`（整改建议）。
+- **仪器校准与测点证据分离**：仪器台账、校准记录独立成表；测点录入（或复测）时把**仪器编号与当次校准有效期**固化为证据快照（`meterCode` / `meterName` / `calibrationId` / `calibrationValidUntil`），此后仪器送检、校准更正、仪器注销都不会悄悄改变快照；只改实测值同样不触碰快照。
+- **证据状态机**：测点证据分「有效 / 待复测 / 待补证 / 需补充」。更正校准记录时（单事务、`revision` 递增）：未签发的受影响测点退回**待复测**、未确认判定作废；已签发结论保留原依据、测点与判定标记**需补充**。失效以 `校准记录id#revision` 为幂等键，写入失败整体回滚、重试不重复失效。待复测清单与已确认范围（含需补充数）在判定页常驻展示。
+- **签发锁定**：检测人确认即签发（`issuedAt` 落戳），签发后结论、依据与测点数据锁定，初判、批量改判、编辑、删除一律拒绝；证据非「有效」（待复测 / 待补证）的测点不能签发。
+- **升级迁移**：`db.version(1)` 保留初版结构，`db.version(2)` 补齐索引与时间戳，`db.version(3)` 新增仪器/校准两表并把旧测点的 `meter` 自由文本解析重建为台账与校准占位记录——能解析出仪器编号的证据有效，缺少编号的测点归入**待补证**；判定记录补签发时间与需补充标记。调整字段结构时递增 `DB_VERSION` 并补迁移。
+- **首屏播种**：`initDatabase()` 在 `buildings` 表为空时执行幂等播种，生成互相引用的演示数据（3 栋建筑物 / 6 个防雷装置 / 3 台仪器含 1 台已注销 / 3 条校准记录 / 9 个测点含 1 个待补证 / 9 条判定 / 2 条整改建议），其中既有合格样本也有超限样本，便于演示挂红、整改与结论导出。
 - **实时同步**：`utils/db.ts` 的 `watchTable()` 基于 Dexie `liveQuery` 订阅表变化，Svelte store 自动刷新，页面用 `$store` 只读订阅。
 - **判定规则**：实测电阻 ≤ 限值判合格；限值初始值按防雷类别与装置类型建议（一类/二类接地装置 4 Ω，其余 10 Ω），最终以设计文件与规范条款为准。
-- **备份与恢复**：`/backup` 页可导出包含五张表的 JSON 快照，支持「覆盖导入」与「追加导入（重新分配 id）」；备份时间写入 `localStorage`，页脚与备份页均展示结构版本号。
+- **备份与恢复**：`/backup` 页可导出包含七张表的 JSON 快照，测点证据状态随备份保留；支持「覆盖导入」与「追加导入（重新分配 id，仪器/校准/快照外键一并重映射）」。导入旧版（v2 及以前）备份时按升级规则重建仪器台账，缺仪器编号的测点同样归入待补证；备份时间写入 `localStorage`，页脚与备份页均展示结构版本号。
 - **离线可用**：应用为纯静态资源，无任何网络请求；换浏览器或清空站点数据后数据不跟随，需通过 JSON 备份迁移。

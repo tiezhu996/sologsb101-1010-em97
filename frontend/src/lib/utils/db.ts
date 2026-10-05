@@ -9,15 +9,17 @@ import Dexie, { liveQuery, type Table } from 'dexie'
 import type { Building } from '$lib/types/building'
 import type { Device } from '$lib/types/device'
 import { DEVICE_TYPES } from '$lib/types/device'
+import type { Meter, Calibration } from '$lib/types/meter'
 import type { Point } from '$lib/types/point'
 import type { Verdict } from '$lib/types/verdict'
 import { defaultBasis, judgePoint } from '$lib/types/verdict'
 import type { Rectify } from '$lib/types/rectify'
 import { SUGGESTION_TEMPLATES } from '$lib/types/rectify'
 import { suggestLimitOhm } from '$lib/utils/resistance'
+import { buildEvidenceSnapshot, emptyEvidenceSnapshot, resolveLegacyEvidence } from '$lib/utils/evidence'
 
 /** 当前数据结构版本号：每次调整字段结构必须 +1 并补迁移 */
-export const DB_VERSION = 2
+export const DB_VERSION = 3
 
 /** 数据库名（浏览器 IndexedDB 中的库名） */
 export const DB_NAME = 'gblightprot'
@@ -36,6 +38,8 @@ export interface BackupPayload {
   exportedAt: string
   buildings: Building[]
   devices: Device[]
+  meters: Meter[]
+  calibrations: Calibration[]
   points: Point[]
   verdicts: Verdict[]
   rectifies: Rectify[]
@@ -44,6 +48,8 @@ export interface BackupPayload {
 export class LightProtDatabase extends Dexie {
   buildings!: Table<Building, string>
   devices!: Table<Device, string>
+  meters!: Table<Meter, string>
+  calibrations!: Table<Calibration, string>
   points!: Table<Point, string>
   verdicts!: Table<Verdict, string>
   rectifies!: Table<Rectify, string>
@@ -61,7 +67,7 @@ export class LightProtDatabase extends Dexie {
     })
 
     // v2：补齐筛选与统计需要的索引（用途/类别/层数、装置类型、限值、判定与状态）
-    this.version(DB_VERSION)
+    this.version(2)
       .stores({
         buildings: 'id, name, usage, protectionClass, floors, heightM, updatedAt',
         devices: 'id, buildingId, type, material, spec, quantity, installDate, updatedAt',
@@ -89,6 +95,49 @@ export class LightProtDatabase extends Dexie {
               Object.assign(row, factory())
             })
         }
+      })
+
+    // v3：仪器台账与校准记录独立成表；测点改为证据快照（仪器编号 + 当次校准有效期），
+    // 判定记录增加签发时间与需补充标记
+    this.version(DB_VERSION)
+      .stores({
+        buildings: 'id, name, usage, protectionClass, floors, heightM, updatedAt',
+        devices: 'id, buildingId, type, material, spec, quantity, installDate, updatedAt',
+        meters: 'id, code, name, state, updatedAt',
+        calibrations: 'id, meterId, validUntil, updatedAt',
+        points: 'id, deviceId, code, measuredOhm, limitOhm, measureDate, evidenceState, meterId, calibrationId, updatedAt',
+        verdicts: 'id, pointId, result, confirmed, verdictDate, updatedAt',
+        rectifies: 'id, buildingId, pointId, state, deadline, updatedAt'
+      })
+      .upgrade(async (tx) => {
+        const now = Date.now()
+        // 1) 旧测点只有 meter 自由文本：解析出「仪器名称 / 编号」重建台账与校准占位记录；
+        //    缺少仪器编号的测点归入待补证
+        const legacyPoints = (await tx.table('points').toArray()) as Array<Record<string, unknown>>
+        const { meters, calibrations, snapshots } = resolveLegacyEvidence(
+          legacyPoints.map((row) => ({ id: String(row.id), meter: typeof row.meter === 'string' ? row.meter : '' })),
+          now
+        )
+        if (meters.length > 0) await tx.table('meters').bulkAdd(meters)
+        if (calibrations.length > 0) await tx.table('calibrations').bulkAdd(calibrations)
+        await tx
+          .table('points')
+          .toCollection()
+          .modify((row: Record<string, unknown>) => {
+            const snapshot = snapshots.get(String(row.id)) ?? emptyEvidenceSnapshot()
+            Object.assign(row, snapshot)
+            delete row.meter
+          })
+        // 2) 判定记录补签发时间与需补充标记：已确认的视为已签发，签发时间取最后更新时间
+        await tx
+          .table('verdicts')
+          .toCollection()
+          .modify((row: Record<string, unknown>) => {
+            if (typeof row.issuedAt !== 'number') {
+              row.issuedAt = row.confirmed === true && typeof row.updatedAt === 'number' ? row.updatedAt : null
+            }
+            if (typeof row.needsSupplement !== 'boolean') row.needsSupplement = false
+          })
       })
   }
 }
@@ -127,7 +176,8 @@ interface SeedPoint {
   location: string
   measuredOhm: number
   limitOhm: number
-  meter: string
+  /** 选用的仪器 id；null 表示历史遗留未登记仪器（归入待补证） */
+  meterId: string | null
   measureDate: string
 }
 
@@ -143,12 +193,48 @@ interface SeedDevice {
 }
 
 /**
- * 播种演示数据：2 栋建筑物 → 6 个防雷装置 → 9 个测点 → 逐点自动初判 → 2 条整改建议，
+ * 播种演示数据：3 栋建筑物 → 6 个防雷装置 → 9 个测点 → 逐点自动初判 → 2 条整改建议，
+ * 并配套仪器台账与校准记录（含一台已注销仪器与一个待补证测点），
  * 保证父 → 子 → 孙三层链路可点开，且既有合格也有不合格样本。
  */
 export async function seedDemoData(): Promise<void> {
   const now = Date.now()
   const today = new Date(now).toISOString().slice(0, 10)
+
+  // 仪器台账：两台在用、一台已注销（注销仪器的历史快照保持不变）
+  const meters: Array<Omit<Meter, 'createdAt' | 'updatedAt'>> = [
+    { id: 'mtr_zc8', code: 'No.20230517', name: 'ZC-8 接地电阻测试仪', state: '在用' },
+    { id: 'mtr_der2571', code: 'No.A221104', name: 'DER2571 数字接地电阻表', state: '在用' },
+    { id: 'mtr_zc8_old', code: 'No.20201122', name: 'ZC-8 接地电阻测试仪', state: '注销' }
+  ]
+
+  // 校准记录：与测点证据快照分开保存；已注销仪器的校准早已过期
+  const calibrations: Array<Omit<Calibration, 'createdAt' | 'updatedAt'>> = [
+    {
+      id: 'cal_zc8_2026',
+      meterId: 'mtr_zc8',
+      certificateNo: 'JL2026-0318',
+      calibratedAt: '2026-03-18',
+      validUntil: '2027-03-17',
+      revision: 0
+    },
+    {
+      id: 'cal_der_2025',
+      meterId: 'mtr_der2571',
+      certificateNo: 'JL2025-1104',
+      calibratedAt: '2025-11-04',
+      validUntil: '2026-11-03',
+      revision: 0
+    },
+    {
+      id: 'cal_old_2020',
+      meterId: 'mtr_zc8_old',
+      certificateNo: 'JL2020-0522',
+      calibratedAt: '2020-05-22',
+      validUntil: '2021-05-21',
+      revision: 0
+    }
+  ]
 
   const buildings: Array<Omit<Building, 'createdAt' | 'updatedAt'>> = [
     {
@@ -197,7 +283,7 @@ export async function seedDemoData(): Promise<void> {
           location: '屋面西北角接闪带引下点',
           measuredOhm: 3.2,
           limitOhm: 10,
-          meter: 'ZC-8 接地电阻测试仪 / No.20230517',
+          meterId: 'mtr_zc8',
           measureDate: today
         },
         {
@@ -207,7 +293,7 @@ export async function seedDemoData(): Promise<void> {
           location: '屋面东南角接闪带引下点',
           measuredOhm: 4.1,
           limitOhm: 10,
-          meter: 'ZC-8 接地电阻测试仪 / No.20230517',
+          meterId: 'mtr_zc8',
           measureDate: today
         }
       ]
@@ -228,7 +314,7 @@ export async function seedDemoData(): Promise<void> {
           location: '北侧 3 号引下线断接卡处',
           measuredOhm: 12.6,
           limitOhm: 10,
-          meter: 'ZC-8 接地电阻测试仪 / No.20230517',
+          meterId: 'mtr_zc8',
           measureDate: today
         },
         {
@@ -238,7 +324,7 @@ export async function seedDemoData(): Promise<void> {
           location: '南侧 6 号引下线断接卡处',
           measuredOhm: 6.8,
           limitOhm: 10,
-          meter: 'ZC-8 接地电阻测试仪 / No.20230517',
+          meterId: 'mtr_zc8',
           measureDate: today
         }
       ]
@@ -259,7 +345,7 @@ export async function seedDemoData(): Promise<void> {
           location: '罐区环形接地体东侧测试井',
           measuredOhm: 3.9,
           limitOhm: 4,
-          meter: 'ZC-8 接地电阻测试仪 / No.20230517',
+          meterId: 'mtr_zc8',
           measureDate: today
         },
         {
@@ -269,7 +355,7 @@ export async function seedDemoData(): Promise<void> {
           location: '罐区环形接地体西侧测试井',
           measuredOhm: 5.4,
           limitOhm: 4,
-          meter: 'ZC-8 接地电阻测试仪 / No.20230517',
+          meterId: 'mtr_zc8',
           measureDate: today
         }
       ]
@@ -290,7 +376,7 @@ export async function seedDemoData(): Promise<void> {
           location: '裙房屋面接闪杆杆基',
           measuredOhm: 7.4,
           limitOhm: 10,
-          meter: 'DER2571 数字接地电阻表 / No.A221104',
+          meterId: 'mtr_der2571',
           measureDate: today
         }
       ]
@@ -311,7 +397,7 @@ export async function seedDemoData(): Promise<void> {
           location: '主楼东侧引下线断接卡',
           measuredOhm: 8.9,
           limitOhm: 10,
-          meter: 'DER2571 数字接地电阻表 / No.A221104',
+          meterId: 'mtr_der2571',
           measureDate: today
         },
         {
@@ -321,7 +407,7 @@ export async function seedDemoData(): Promise<void> {
           location: '主楼西侧引下线断接卡',
           measuredOhm: 15.2,
           limitOhm: 10,
-          meter: 'DER2571 数字接地电阻表 / No.A221104',
+          meterId: 'mtr_der2571',
           measureDate: today
         }
       ]
@@ -342,7 +428,7 @@ export async function seedDemoData(): Promise<void> {
           location: '教学楼屋面接闪带东北角',
           measuredOhm: 9.4,
           limitOhm: 10,
-          meter: 'ZC-8 接地电阻测试仪 / No.20201122',
+          meterId: null,
           measureDate: today
         }
       ]
@@ -351,7 +437,7 @@ export async function seedDemoData(): Promise<void> {
 
   await db.transaction(
     'rw',
-    [db.buildings, db.devices, db.points, db.verdicts, db.rectifies],
+    [db.buildings, db.devices, db.meters, db.calibrations, db.points, db.verdicts, db.rectifies],
     async () => {
       const stamp = (index: number): { createdAt: number; updatedAt: number } => ({
         createdAt: now + index,
@@ -360,24 +446,40 @@ export async function seedDemoData(): Promise<void> {
 
       await db.buildings.bulkPut(buildings.map((building, index) => ({ ...building, ...stamp(index) })))
 
+      // 仪器台账与校准记录先行入库，测点录入时据此固化证据快照
+      const seededMeters: Meter[] = meters.map((meter, index) => ({ ...meter, ...stamp(index) }))
+      const seededCalibrations: Calibration[] = calibrations.map((calibration, index) => ({
+        ...calibration,
+        ...stamp(index)
+      }))
+      await db.meters.bulkPut(seededMeters)
+      await db.calibrations.bulkPut(seededCalibrations)
+
       const allDevices: Device[] = []
       const allPoints: Point[] = []
       devices.forEach((device, index) => {
         const { points, ...rest } = device
         allDevices.push({ ...rest, ...stamp(index) })
         points.forEach((point, pointIndex) => {
-          allPoints.push({ ...point, ...stamp(index * 100 + pointIndex) })
+          const { meterId, ...restPoint } = point
+          // 录入即固定仪器编号与当次校准有效期；未登记仪器的历史测点归入待补证
+          const snapshot = meterId
+            ? buildEvidenceSnapshot(meterId, seededMeters, seededCalibrations)
+            : emptyEvidenceSnapshot()
+          allPoints.push({ ...restPoint, ...snapshot, ...stamp(index * 100 + pointIndex) })
         })
       })
       await db.devices.bulkPut(allDevices)
       await db.points.bulkPut(allPoints)
 
-      // 逐点自动初判：实测值 ≤ 限值判合格，否则不合格，检测人确认后生效
+      // 逐点自动初判：实测值 ≤ 限值判合格，否则不合格；证据有效的演示数据直接签发，
+      // 待补证测点保持未签发（证据不全不能出具结论）
       const buildingOfDevice = new Map(allDevices.map((device) => [device.id, device.buildingId]))
       const deviceOfPoint = new Map(allDevices.map((device) => [device.id, device]))
       const verdicts: Verdict[] = allPoints.map((point, index) => {
         const device = deviceOfPoint.get(point.deviceId)
         const building = buildings.find((item) => item.id === buildingOfDevice.get(point.deviceId))
+        const issuable = point.evidenceState === '有效'
         return {
           id: `vrd_${point.id}`,
           pointId: point.id,
@@ -385,7 +487,9 @@ export async function seedDemoData(): Promise<void> {
           basis: defaultBasis(building?.protectionClass ?? '三类', device?.type ?? '接地体', point.limitOhm),
           inspector: '陈立群',
           verdictDate: point.measureDate,
-          confirmed: true,
+          confirmed: issuable,
+          issuedAt: issuable ? now + 1000 + index : null,
+          needsSupplement: false,
           ...stamp(1000 + index)
         }
       })
@@ -446,15 +550,21 @@ export async function initDatabase(): Promise<void> {
 
 /** 清空全部业务表（导入覆盖与重置共用） */
 export async function clearAllTables(): Promise<void> {
-  await db.transaction('rw', [db.buildings, db.devices, db.points, db.verdicts, db.rectifies], async () => {
-    await Promise.all([
-      db.buildings.clear(),
-      db.devices.clear(),
-      db.points.clear(),
-      db.verdicts.clear(),
-      db.rectifies.clear()
-    ])
-  })
+  await db.transaction(
+    'rw',
+    [db.buildings, db.devices, db.meters, db.calibrations, db.points, db.verdicts, db.rectifies],
+    async () => {
+      await Promise.all([
+        db.buildings.clear(),
+        db.devices.clear(),
+        db.meters.clear(),
+        db.calibrations.clear(),
+        db.points.clear(),
+        db.verdicts.clear(),
+        db.rectifies.clear()
+      ])
+    }
+  )
 }
 
 /** 清空并重新播种演示数据 */
@@ -465,14 +575,16 @@ export async function resetDatabase(): Promise<void> {
 
 /** 统计各表行数，供页脚概览与备份页展示 */
 export async function countAll(): Promise<Record<string, number>> {
-  const [buildings, devices, points, verdicts, rectifies] = await Promise.all([
+  const [buildings, devices, meters, calibrations, points, verdicts, rectifies] = await Promise.all([
     db.buildings.count(),
     db.devices.count(),
+    db.meters.count(),
+    db.calibrations.count(),
     db.points.count(),
     db.verdicts.count(),
     db.rectifies.count()
   ])
-  return { buildings, devices, points, verdicts, rectifies }
+  return { buildings, devices, meters, calibrations, points, verdicts, rectifies }
 }
 
 /** 写入结构版本号到 localStorage，便于备份页比对 */

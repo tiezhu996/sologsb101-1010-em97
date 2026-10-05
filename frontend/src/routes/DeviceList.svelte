@@ -25,6 +25,7 @@
   import { pointsOfDevice } from '$lib/stores/pointStore.ts'
   import { DEVICE_MATERIALS, DEVICE_TYPES } from '$lib/types/device.ts'
   import type { Device, DeviceType } from '$lib/types/device.ts'
+  import { formatEvidence } from '$lib/utils/evidence.ts'
   import { suggestLimitOhm } from '$lib/utils/resistance.ts'
   import { readQuery, writeQuery } from '$lib/utils/query.ts'
   import { useRouter } from '$lib/utils/router.ts'
@@ -319,7 +320,7 @@
                               <td class="is-num gb-mono">{point.measuredOhm}</td>
                               <td class="is-num gb-mono">{point.limitOhm}</td>
                               <td><QualifyTag measuredOhm={point.measuredOhm} limitOhm={point.limitOhm} size="small" /></td>
-                              <td class="gb-hint">{point.meter}</td>
+                              <td class="gb-hint">{formatEvidence(point)}</td>
                             </tr>
                           {/each}
                         </tbody>

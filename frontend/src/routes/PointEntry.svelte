@@ -12,6 +12,7 @@
     activeDeviceId,
     bulkSetMeasured,
     createPoint,
+    evidenceCounts,
     importPointRows,
     pasteText,
     pointList,
@@ -22,10 +23,14 @@
     updatePoint
   } from '$lib/stores/pointStore.ts'
   import { buildingById, deviceList, selectBuilding } from '$lib/stores/buildingStore.ts'
+  import { activeMeters, calibrationList, meterList } from '$lib/stores/meterStore.ts'
+  import { verdictList } from '$lib/stores/rectifyStore.ts'
   import { parsePointPaste } from '$lib/types/point.ts'
   import type { Point, PointPasteRow } from '$lib/types/point.ts'
   import { DEVICE_TYPES } from '$lib/types/device.ts'
   import type { DeviceType } from '$lib/types/device.ts'
+  import { isCalibrationExpired, latestCalibrationOf } from '$lib/types/meter.ts'
+  import { formatEvidence } from '$lib/utils/evidence.ts'
   import { isQualified, limitRatio, qualifyRate, suggestLimitOhm } from '$lib/utils/resistance.ts'
   import { readQuery, writeQuery } from '$lib/utils/query.ts'
   import { useRouter } from '$lib/utils/router.ts'
@@ -37,7 +42,8 @@
     location: string
     measuredOhm: number
     limitOhm: number
-    meter: string
+    /** 选用的仪器 id（空串表示不关联，归入待补证） */
+    meterId: string
     measureDate: string
   }
 
@@ -56,6 +62,7 @@
   let showPaste = $state(false)
   let pasteErrors = $state<string[]>([])
   let pastePreview = $state<PointPasteRow[]>([])
+  let pasteMeterId = $state('')
   let bulkValue = $state<number | null>(null)
 
   let form = $state<PointForm>({
@@ -63,8 +70,25 @@
     location: '',
     measuredOhm: 0,
     limitOhm: 10,
-    meter: '',
+    meterId: '',
     measureDate: new Date().toISOString().slice(0, 10)
+  })
+
+  /** 已签发结论的测点 id 集合：这些测点锁定，不能编辑 / 删除 */
+  const issuedPointIds = $derived(new Set($verdictList.filter((verdict) => verdict.confirmed).map((v) => v.pointId)))
+
+  /** 仪器下拉选项：在用仪器 + 各自最新校准有效期；当前测点所用仪器已注销时一并列出（避免误改选） */
+  const meterOptions = $derived.by(() => {
+    const options = $activeMeters.map((meter) => {
+      const calibration = latestCalibrationOf($calibrationList, meter.id)
+      const validText = calibration?.validUntil ? `有效期至 ${calibration.validUntil}` : '未登记校准'
+      return { label: `${meter.name} / ${meter.code}（${validText}）`, value: meter.id }
+    })
+    const current = $meterList.find((meter) => meter.id === form.meterId)
+    if (current && current.state === '注销') {
+      options.push({ label: `${current.name} / ${current.code}（已注销，建议改选）`, value: current.id })
+    }
+    return options
   })
 
   const deviceOptions = $derived(
@@ -89,7 +113,7 @@
       const device = row.device
       if (!device) return false
       const building = buildingById(device.buildingId)
-      const text = `${row.point.code}${row.point.location}${row.point.meter}${building?.name ?? ''}${device.material}`
+      const text = `${row.point.code}${row.point.location}${row.point.meterName}${row.point.meterCode}${building?.name ?? ''}${device.material}`
       return keyword.trim().length === 0 || text.includes(keyword.trim())
     })
   )
@@ -123,13 +147,17 @@
       location: '',
       measuredOhm: 0,
       limitOhm: defaultLimit,
-      meter: existing[0]?.meter ?? '',
+      meterId: existing[0]?.meterId ?? $activeMeters[0]?.id ?? '',
       measureDate: existing[0]?.measureDate ?? new Date().toISOString().slice(0, 10)
     }
     showDialog = true
   }
 
   function openEdit(point: Point): void {
+    if (issuedPointIds.has(point.id)) {
+      window.alert(`测点「${point.code}」的结论已签发，测点数据已锁定，不能编辑。`)
+      return
+    }
     editingId = point.id
     formError = ''
     form = {
@@ -137,7 +165,7 @@
       location: point.location,
       measuredOhm: point.measuredOhm,
       limitOhm: point.limitOhm,
-      meter: point.meter,
+      meterId: point.meterId ?? '',
       measureDate: point.measureDate
     }
     showDialog = true
@@ -161,37 +189,53 @@
       location: form.location.trim(),
       measuredOhm: Number(form.measuredOhm),
       limitOhm: Number(form.limitOhm),
-      meter: form.meter.trim(),
+      meterId: form.meterId || null,
       measureDate: form.measureDate
     }
-    if (editingId) {
-      await updatePoint(editingId, payload)
-    } else if ($activeDeviceId) {
-      await createPoint($activeDeviceId, payload)
+    try {
+      if (editingId) {
+        await updatePoint(editingId, payload)
+      } else if ($activeDeviceId) {
+        await createPoint($activeDeviceId, payload)
+      }
+      showDialog = false
+    } catch (error) {
+      formError = error instanceof Error ? error.message : '保存失败'
     }
-    showDialog = false
   }
 
   async function confirmRemove(point: Point): Promise<void> {
+    if (issuedPointIds.has(point.id)) {
+      window.alert(`测点「${point.code}」的结论已签发，不能删除。`)
+      return
+    }
     const ok = window.confirm(`删除测点「${point.code}」（实测 ${point.measuredOhm} Ω）并同时删除其判定记录？`)
     if (!ok) return
-    await removePoint(point.id)
+    try {
+      await removePoint(point.id)
+    } catch (error) {
+      window.alert(error instanceof Error ? error.message : '删除失败')
+    }
   }
 
   async function applyBulkMeasured(): Promise<void> {
     if (!$activeDeviceId || bulkValue === null) return
     const ok = window.confirm(
-      `将该装置全部 ${pointsOfDevice($activeDeviceId).length} 个测点的实测电阻统一改写为 ${bulkValue} Ω？`
+      `将该装置全部 ${pointsOfDevice($activeDeviceId).length} 个测点的实测电阻统一改写为 ${bulkValue} Ω？（已签发测点自动跳过）`
     )
     if (!ok) return
-    await bulkSetMeasured($activeDeviceId, Number(bulkValue))
+    const result = await bulkSetMeasured($activeDeviceId, Number(bulkValue))
     bulkValue = null
+    if (result.skipped > 0) {
+      window.alert(`已改写 ${result.modified} 个测点；${result.skipped} 个测点结论已签发，保持原值未动。`)
+    }
   }
 
   function openPaste(): void {
     pasteText.set('')
     pasteErrors = []
     pastePreview = []
+    pasteMeterId = ($activeDeviceId ? (pointsOfDevice($activeDeviceId)[0]?.meterId ?? '') : '') || ($activeMeters[0]?.id ?? '')
     showPaste = true
   }
 
@@ -211,11 +255,15 @@
       `将用 ${parsed.rows.length} 行数据替换该装置现有 ${pointsOfDevice($activeDeviceId).length} 个测点，确认导入？`
     )
     if (!ok) return
-    await importPointRows($activeDeviceId, parsed.rows, {
-      meter: pointsOfDevice($activeDeviceId)[0]?.meter ?? '未填写',
-      measureDate: new Date().toISOString().slice(0, 10)
-    })
-    showPaste = false
+    try {
+      await importPointRows($activeDeviceId, parsed.rows, {
+        meterId: pasteMeterId || null,
+        measureDate: new Date().toISOString().slice(0, 10)
+      })
+      showPaste = false
+    } catch (error) {
+      pasteErrors = [error instanceof Error ? error.message : '导入失败']
+    }
   }
 
   function handleFilterChange(next: FilterChange): void {
@@ -286,7 +334,25 @@
     />
     <StatBadge label="合格率" value={totals.rate} percent={totals.rate} tone="success" />
     <StatBadge label="选中装置测点" value={totals.activeDevicePoints} suffix="点" tone="info" />
+    <StatBadge
+      label="待复测"
+      value={$evidenceCounts['待复测']}
+      suffix="点"
+      tone={$evidenceCounts['待复测'] > 0 ? 'danger' : 'default'}
+    />
+    <StatBadge
+      label="待补证"
+      value={$evidenceCounts['待补证']}
+      suffix="点"
+      tone={$evidenceCounts['待补证'] > 0 ? 'warning' : 'default'}
+    />
   </div>
+
+  {#if $evidenceCounts['待复测'] > 0}
+    <p class="gb-alert">
+      有 {$evidenceCounts['待复测']} 个测点因仪器校准记录更正退回「待复测」：请重新实测并保存（保存时重新固化仪器与校准有效期快照），再到判定页签发结论。
+    </p>
+  {/if}
 
   {#if $activeDeviceId}
     <div class="gb-panel">
@@ -351,7 +417,17 @@
                   </span>
                 {/if}
               </td>
-              <td class="gb-hint">{row.point.meter}</td>
+              <td>
+                <div class="gb-hint">{formatEvidence(row.point)}</div>
+                {#if row.point.evidenceState !== '有效'}
+                  <span class="gb-tag" class:is-warn={row.point.evidenceState !== '需补充'}>{row.point.evidenceState}</span>
+                {:else if isCalibrationExpired(row.point.calibrationValidUntil, row.point.measureDate)}
+                  <span class="gb-danger">校准时已过期</span>
+                {/if}
+                {#if issuedPointIds.has(row.point.id)}
+                  <span class="gb-tag">已签发锁定</span>
+                {/if}
+              </td>
               <td class="gb-mono">{row.point.measureDate}</td>
               <td class="row-actions">
                 <button class="btn btn--small" type="button" onclick={() => openEdit(row.point)}>编辑</button>
@@ -408,8 +484,13 @@
             <input type="number" min="0.01" max="1000" step="0.01" bind:value={form.limitOhm} />
           </label>
           <label class="gb-field">
-            <span>检测仪器</span>
-            <input bind:value={form.meter} placeholder="如 ZC-8 接地电阻测试仪 / No.20230517" maxlength="60" />
+            <span>检测仪器（固化快照）</span>
+            <select bind:value={form.meterId}>
+              <option value="">不关联仪器（归入待补证）</option>
+              {#each meterOptions as option (option.value)}
+                <option value={option.value}>{option.label}</option>
+              {/each}
+            </select>
           </label>
           <label class="gb-field">
             <span>检测日期</span>
@@ -455,6 +536,15 @@
             placeholder="JD-07,罐区东侧测试井,3.8,4"
             oninput={(event: Event) => pasteText.set((event.currentTarget as HTMLTextAreaElement).value)}
           ></textarea>
+        </label>
+        <label class="gb-field">
+          <span>本批测点使用的仪器（统一固化快照）</span>
+          <select bind:value={pasteMeterId}>
+            <option value="">不关联仪器（归入待补证）</option>
+            {#each meterOptions as option (option.value)}
+              <option value={option.value}>{option.label}</option>
+            {/each}
+          </select>
         </label>
         {#if pasteErrors.length > 0}
           <div class="errors">
@@ -532,6 +622,12 @@
 
   tr.is-bad td {
     background: #fff6f4;
+  }
+
+  .gb-tag.is-warn {
+    color: #8a5a12;
+    border-color: #f0c78a;
+    background: #fff8ec;
   }
 
   .errors {

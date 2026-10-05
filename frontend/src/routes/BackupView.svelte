@@ -31,7 +31,15 @@
   import type { ConclusionLine, CountMap } from '$lib/utils/export.ts'
   import { RECTIFY_STATES } from '$lib/types/rectify.ts'
 
-  const EMPTY_COUNTS: CountMap = { buildings: 0, devices: 0, points: 0, verdicts: 0, rectifies: 0 }
+  const EMPTY_COUNTS: CountMap = {
+    buildings: 0,
+    devices: 0,
+    meters: 0,
+    calibrations: 0,
+    points: 0,
+    verdicts: 0,
+    rectifies: 0
+  }
 
   let counts = $state<CountMap>(EMPTY_COUNTS)
   let lastBackupAt = $state<string | null>(null)
@@ -212,6 +220,12 @@
               <td>
                 <div>{line.conclusion}</div>
                 <div class="gb-hint">合格率 {line.qualifyRatePct}%</div>
+                {#if line.pendingRetestCount > 0}
+                  <div class="gb-danger">{line.pendingRetestCount} 个测点待复测</div>
+                {/if}
+                {#if line.supplementCount > 0}
+                  <div class="gb-danger">{line.supplementCount} 条已签发结论需补充</div>
+                {/if}
               </td>
               <td class="gb-hint">{line.worstPoint}</td>
               <td class="gb-hint">{line.advice}</td>
@@ -262,7 +276,7 @@
   <div class="gb-panel">
     <div class="gb-panel-title">
       <h3>全量 JSON 导入导出</h3>
-      <span class="gb-hint">导出内容包含 buildings / devices / points / verdicts / rectifies 五张表</span>
+      <span class="gb-hint">导出内容包含 buildings / devices / meters / calibrations / points / verdicts / rectifies 七张表，测点证据状态随备份保留</span>
     </div>
     <div class="import-row">
       <label class="gb-field">
@@ -286,14 +300,18 @@
         <tr>
           <th>建筑物 / 装置</th>
           <td class="gb-mono">{counts.buildings} / {counts.devices}</td>
-          <th>测点 / 判定</th>
-          <td class="gb-mono">{counts.points} / {counts.verdicts}</td>
+          <th>仪器 / 校准记录</th>
+          <td class="gb-mono">{counts.meters} / {counts.calibrations}</td>
         </tr>
         <tr>
+          <th>测点 / 判定</th>
+          <td class="gb-mono">{counts.points} / {counts.verdicts}</td>
           <th>整改建议</th>
           <td class="gb-mono">{counts.rectifies}</td>
+        </tr>
+        <tr>
           <th>最近备份时间</th>
-          <td>{lastBackupAt ? new Date(lastBackupAt).toLocaleString('zh-CN') : '尚未备份'}</td>
+          <td colspan="3">{lastBackupAt ? new Date(lastBackupAt).toLocaleString('zh-CN') : '尚未备份'}</td>
         </tr>
         <tr>
           <th>状态分布</th>

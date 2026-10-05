@@ -17,7 +17,9 @@
     createRectify,
     filteredRectifies,
     generateRectifies,
+    issuedScope,
     patchRectifyFilter,
+    pendingRetestRows,
     qualifyStats,
     rectifyFilter,
     rectifyList,
@@ -31,6 +33,7 @@
   } from '$lib/stores/rectifyStore.ts'
   import { buildingList, deviceList } from '$lib/stores/buildingStore.ts'
   import { pointList } from '$lib/stores/pointStore.ts'
+  import { formatEvidence } from '$lib/utils/evidence.ts'
   import { RECTIFY_STATES, RECTIFY_TRANSITIONS, SUGGESTION_TEMPLATES } from '$lib/types/rectify.ts'
   import type { RectifyState } from '$lib/types/rectify.ts'
   import { VERDICT_RESULTS } from '$lib/types/verdict.ts'
@@ -127,25 +130,33 @@
   }
 
   async function runAutoJudgeAll(): Promise<void> {
-    const count = await autoJudgeAll(inspector)
-    notice = `已对 ${count} 个测点完成自动初判，请逐条由检测人确认生效。`
+    const result = await autoJudgeAll(inspector)
+    notice = `已对 ${result.judged} 个测点完成自动初判，请逐条由检测人确认签发；${result.skipped} 条已签发结论保持原样。`
   }
 
   async function runAutoJudge(pointId: string): Promise<void> {
     await autoJudgePoint(pointId, inspector)
-    notice = '已按实测值与限值比对给出初判，请确认生效。'
+    notice = '已按实测值与限值比对给出初判，请确认签发（已签发结论不会被初判改动）。'
   }
 
   async function confirmOne(row: (typeof rows)[number]): Promise<void> {
-    if (!row.verdict) {
-      await autoJudgePoint(row.point.id, inspector)
-      const latest = $verdictRows.find((item) => item.point.id === row.point.id)
-      if (latest?.verdict) await confirmVerdict(latest.verdict.id, { inspector })
-      notice = `测点 ${row.point.code} 的判定已确认生效。`
+    if (row.point.evidenceState !== '有效') {
+      notice = `测点 ${row.point.code} 证据「${row.point.evidenceState}」，不能签发结论；请先到测点页完成复测或补证。`
       return
     }
-    await confirmVerdict(row.verdict.id, { inspector })
-    notice = `测点 ${row.point.code} 的判定已确认生效。`
+    try {
+      if (!row.verdict) {
+        await autoJudgePoint(row.point.id, inspector)
+        const latest = $verdictRows.find((item) => item.point.id === row.point.id)
+        if (latest?.verdict) await confirmVerdict(latest.verdict.id, { inspector })
+        notice = `测点 ${row.point.code} 的判定已确认签发，签发后结论锁定。`
+        return
+      }
+      await confirmVerdict(row.verdict.id, { inspector })
+      notice = `测点 ${row.point.code} 的判定已确认签发，签发后结论锁定。`
+    } catch (error) {
+      notice = error instanceof Error ? error.message : '签发失败'
+    }
   }
 
   async function bulkSet(result: VerdictResult): Promise<void> {
@@ -153,8 +164,11 @@
       notice = '请先勾选要批量改判的测点。'
       return
     }
-    const count = await bulkSetVerdictResult(selected, result, bulkInspector)
-    notice = `已批量将 ${count} 个测点的判定结论改为「${result}」并确认生效。`
+    const { changed, skipped } = await bulkSetVerdictResult(selected, result, bulkInspector)
+    notice =
+      skipped > 0
+        ? `已批量将 ${changed} 个测点的判定结论改为「${result}」并签发；${skipped} 个测点已签发或证据待复测 / 待补证，保持原样。`
+        : `已批量将 ${changed} 个测点的判定结论改为「${result}」并签发。`
     selected = []
   }
 
@@ -307,6 +321,18 @@
     <StatBadge label="未确认" value={totals.unconfirmed} suffix="条" tone={totals.unconfirmed > 0 ? 'warning' : 'success'} />
     <StatBadge label="整体合格率" value={$qualifyStats.overall.rate} percent={$qualifyStats.overall.rate} tone="success" />
     <StatBadge label="初判不一致" value={totals.inconsistent} suffix="条" tone={totals.inconsistent > 0 ? 'warning' : 'default'} />
+    <StatBadge
+      label="待复测"
+      value={$pendingRetestRows.length}
+      suffix="点"
+      tone={$pendingRetestRows.length > 0 ? 'danger' : 'default'}
+    />
+    <StatBadge
+      label="已签发 / 需补充"
+      value={$issuedScope.issued}
+      suffix={`条 / ${$issuedScope.needsSupplement} 条`}
+      tone={$issuedScope.needsSupplement > 0 ? 'warning' : 'success'}
+    />
   </div>
 
   <FilterBar
@@ -388,9 +414,16 @@
               <td>
                 {#if row.verdict}
                   <QualifyTag result={row.verdict.result} size="small" />
-                  <div class="gb-hint">
-                    {row.verdict.confirmed ? '已确认生效' : '待检测人确认'} · {row.verdict.inspector || '未署名'}
-                  </div>
+                  {#if row.verdict.confirmed}
+                    <div class="gb-hint">
+                      已签发{row.verdict.issuedAt ? ` · ${new Date(row.verdict.issuedAt).toLocaleDateString('zh-CN')}` : ''} · {row.verdict.inspector || '未署名'}
+                    </div>
+                    {#if row.verdict.needsSupplement}
+                      <div class="gb-danger">校准已更正，需补充</div>
+                    {/if}
+                  {:else}
+                    <div class="gb-hint">待检测人确认 · {row.verdict.inspector || '未署名'}</div>
+                  {/if}
                   {#if !row.consistent}
                     <div class="gb-danger">与初判不一致</div>
                   {/if}
@@ -400,10 +433,20 @@
               </td>
               <td class="gb-hint">{row.verdict?.basis ?? '—'}</td>
               <td class="row-actions">
-                <button class="btn btn--small" type="button" onclick={() => runAutoJudge(row.point.id)}>初判</button>
-                <button class="btn btn--primary btn--small" type="button" onclick={() => confirmOne(row)}>
-                  {row.verdict?.confirmed ? '重新确认' : '确认生效'}
-                </button>
+                {#if row.verdict?.confirmed}
+                  <span class="gb-tag">已签发锁定</span>
+                {:else}
+                  <button class="btn btn--small" type="button" onclick={() => runAutoJudge(row.point.id)}>初判</button>
+                  <button
+                    class="btn btn--primary btn--small"
+                    type="button"
+                    disabled={row.point.evidenceState !== '有效'}
+                    title={row.point.evidenceState !== '有效' ? `证据${row.point.evidenceState}，不能签发` : ''}
+                    onclick={() => confirmOne(row)}
+                  >
+                    确认签发
+                  </button>
+                {/if}
               </td>
             </tr>
           {/each}
@@ -411,6 +454,49 @@
       </table>
     </div>
   {/if}
+
+  <div class="gb-panel">
+    <div class="gb-panel-title">
+      <h3>待复测清单与已确认范围</h3>
+      <span class="gb-hint">
+        校准记录更正退回的测点在复测完成前不能签发；已签发结论与证据快照锁定，不随仪器台账变化
+      </span>
+    </div>
+    <p class="gb-hint">
+      已确认范围：已签发 {$issuedScope.issued} 条结论{#if $issuedScope.needsSupplement > 0}，其中
+        <span class="gb-danger">{$issuedScope.needsSupplement} 条因校准更正需补充</span>（原依据保留）{/if}。
+    </p>
+    {#if $pendingRetestRows.length === 0}
+      <p class="gb-hint">当前没有待复测测点。</p>
+    {:else}
+      <table class="gb-table">
+        <thead>
+          <tr>
+            <th>测点</th>
+            <th>建筑物 / 装置</th>
+            <th>退回时证据快照</th>
+            <th>状态说明</th>
+          </tr>
+        </thead>
+        <tbody>
+          {#each $pendingRetestRows as row (row.point.id)}
+            <tr>
+              <td>
+                <div class="gb-mono">{row.point.code}</div>
+                <div class="gb-hint">{row.point.location}</div>
+              </td>
+              <td>
+                <div>{row.building?.name ?? '未知建筑物'}</div>
+                <div class="gb-hint">{row.device?.type ?? '未知装置'}</div>
+              </td>
+              <td class="gb-hint">{formatEvidence(row.point)}</td>
+              <td class="gb-hint">校准记录已更正，需重新实测并固化新快照后签发</td>
+            </tr>
+          {/each}
+        </tbody>
+      </table>
+    {/if}
+  </div>
 
   <div class="gb-panel">
     <div class="gb-panel-title">

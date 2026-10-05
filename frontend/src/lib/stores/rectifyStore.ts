@@ -50,6 +50,20 @@ export const verdictRows = derived(
     })
 )
 
+/** 待复测清单：校准记录更正后退回的未签发测点（复测完成前不能签发结论） */
+export const pendingRetestRows = derived(verdictRows, ($rows) =>
+  $rows.filter((row) => row.point.evidenceState === '待复测')
+)
+
+/** 已确认范围：已签发结论数量及其中被校准更正波及、需补充的数量 */
+export const issuedScope = derived(verdictList, ($verdicts) => {
+  const issued = $verdicts.filter((verdict) => verdict.confirmed)
+  return {
+    issued: issued.length,
+    needsSupplement: issued.filter((verdict) => verdict.needsSupplement).length
+  }
+})
+
 /** 合格率派生值：全部测点、按建筑物、按装置 */
 export const qualifyStats = derived([pointList, verdictList, deviceList, buildingList], ([$points, $verdicts, $devices, $buildings]) => {
   const qualifiedOf = (pointId: string, measuredOhm: number, limitOhm: number): boolean => {
@@ -150,14 +164,18 @@ export function resetRectifyFilter(): void {
 
 /* ------------------------------- 判定 ------------------------------- */
 
-/** 自动初判某测点，并写入判定记录（检测人确认前 confirmed = false） */
+/**
+ * 自动初判某测点，并写入判定记录（检测人确认前 confirmed = false）。
+ * 已签发的结论保持原样——初判不能改动已签发结果。
+ */
 export async function autoJudgePoint(pointId: string, inspector = ''): Promise<Verdict | null> {
   const point = get(pointList).find((item) => item.id === pointId)
   if (!point) return null
+  const existing = get(verdictList).find((item) => item.pointId === pointId)
+  if (existing?.confirmed) return existing
   const device = get(deviceList).find((item) => item.id === point.deviceId)
   const building = device ? get(buildingList).find((item) => item.id === device.buildingId) : undefined
   const result = judgePoint(point.measuredOhm, point.limitOhm)
-  const existing = get(verdictList).find((item) => item.pointId === pointId)
   const now = Date.now()
   const row: Verdict = {
     id: existing?.id ?? `vrd_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`,
@@ -167,6 +185,8 @@ export async function autoJudgePoint(pointId: string, inspector = ''): Promise<V
     inspector: inspector || existing?.inspector || '',
     verdictDate: point.measureDate,
     confirmed: false,
+    issuedAt: null,
+    needsSupplement: existing?.needsSupplement ?? false,
     createdAt: existing?.createdAt ?? now,
     updatedAt: now
   }
@@ -174,29 +194,61 @@ export async function autoJudgePoint(pointId: string, inspector = ''): Promise<V
   return row
 }
 
-/** 批量自动初判（判定台一键操作） */
-export async function autoJudgeAll(inspector = '陈立群'): Promise<number> {
+/** 批量自动初判（判定台一键操作）；已签发结论跳过不计 */
+export async function autoJudgeAll(inspector = '陈立群'): Promise<{ judged: number; skipped: number }> {
   const points = get(pointList)
+  let judged = 0
+  let skipped = 0
   for (const point of points) {
+    const existing = get(verdictList).find((item) => item.pointId === point.id)
+    if (existing?.confirmed) {
+      skipped += 1
+      continue
+    }
     await autoJudgePoint(point.id, inspector)
+    judged += 1
   }
-  return points.length
+  return { judged, skipped }
 }
 
-/** 检测人确认判定结论生效 */
+/**
+ * 检测人确认判定结论生效（确认即签发）。
+ * 签发后结论锁定：重复确认、改判一律拒绝；证据非「有效」（待复测 / 待补证）不能签发。
+ */
 export async function confirmVerdict(id: string, patch: Partial<Verdict> = {}): Promise<void> {
-  await db.verdicts.update(id, { ...patch, confirmed: true, updatedAt: Date.now() } as never)
+  const verdict = get(verdictList).find((item) => item.id === id) ?? (await db.verdicts.get(id))
+  if (!verdict) throw new Error('判定记录不存在')
+  if (verdict.confirmed) throw new Error('该结论已签发，签发后不能修改')
+  const point = await db.points.get(verdict.pointId)
+  if (point && point.evidenceState !== '有效') {
+    throw new Error(`测点证据「${point.evidenceState}」，不能签发结论；请先完成复测或补证`)
+  }
+  const now = Date.now()
+  await db.verdicts.update(id, { ...patch, confirmed: true, issuedAt: now, updatedAt: now } as never)
 }
 
-/** 批量改判定结论（判定台批量操作） */
-export async function bulkSetVerdictResult(pointIds: string[], result: VerdictResult, inspector: string): Promise<number> {
+/**
+ * 批量改判定结论（判定台批量操作）。
+ * 已签发或证据非「有效」的测点跳过并计数，绝不悄悄改动已签发结论。
+ */
+export async function bulkSetVerdictResult(
+  pointIds: string[],
+  result: VerdictResult,
+  inspector: string
+): Promise<{ changed: number; skipped: number }> {
   const now = Date.now()
+  let changed = 0
+  let skipped = 0
   for (const pointId of pointIds) {
     const point = get(pointList).find((item) => item.id === pointId)
     if (!point) continue
+    const existing = get(verdictList).find((item) => item.pointId === pointId)
+    if (existing?.confirmed || point.evidenceState !== '有效') {
+      skipped += 1
+      continue
+    }
     const device = get(deviceList).find((item) => item.id === point.deviceId)
     const building = device ? get(buildingList).find((item) => item.id === device.buildingId) : undefined
-    const existing = get(verdictList).find((item) => item.pointId === pointId)
     const row: Verdict = {
       id: existing?.id ?? `vrd_${now.toString(36)}${Math.random().toString(36).slice(2, 8)}`,
       pointId,
@@ -205,12 +257,15 @@ export async function bulkSetVerdictResult(pointIds: string[], result: VerdictRe
       inspector,
       verdictDate: existing?.verdictDate ?? point.measureDate,
       confirmed: true,
+      issuedAt: now,
+      needsSupplement: false,
       createdAt: existing?.createdAt ?? now,
       updatedAt: now
     }
     await db.verdicts.put(row)
+    changed += 1
   }
-  return pointIds.length
+  return { changed, skipped }
 }
 
 export async function removeVerdict(id: string): Promise<void> {
@@ -251,9 +306,9 @@ export async function generateRectifies(options: {
     created += 1
   })
   if (records.length > 0) await db.rectifies.bulkPut(records)
-  // 同步刷新判定人信息，保证导出结论有检测人署名
+  // 同步刷新判定人信息，保证导出结论有检测人署名（已签发结论保持原样不改动）
   for (const row of rows) {
-    if (row.verdict && !row.verdict.inspector) {
+    if (row.verdict && !row.verdict.confirmed && !row.verdict.inspector) {
       await db.verdicts.update(row.verdict.id, { inspector, updatedAt: now } as never)
     }
   }
