@@ -102,7 +102,10 @@
     points: rows.length,
     unqualified: rows.filter((row) => !row.qualified).length,
     unconfirmed: rows.filter((row) => !row.verdict?.confirmed).length,
-    inconsistent: rows.filter((row) => row.verdict && !row.consistent).length
+    inconsistent: rows.filter((row) => row.verdict && row.verdict.confirmed && !row.consistent).length,
+    pendingEvidence: rows.filter((row) => row.evidenceStatus !== '有效').length,
+    supplement: rows.filter((row) => row.evidenceStatus === '需补充').length,
+    retest: rows.filter((row) => row.evidenceStatus === '待复测').length
   })
 
   const rectifyOptions = $derived(
@@ -118,43 +121,70 @@
       .sort((a, b) => a.label.localeCompare(b.label, 'zh-Hans-CN'))
   )
 
+  /** 可批量操作：未签发且证据有效的测点（已签发锁定、待复测/待补证/需补充不可签发） */
+  const selectableRows = $derived(rows.filter((row) => !row.verdict?.confirmed && row.issuable))
+
   function toggleSelect(pointId: string): void {
+    const target = rows.find((row) => row.point.id === pointId)
+    if (target?.verdict?.confirmed) return
+    if (target && !target.issuable) {
+      notice = `测点 ${target.point.code} 证据「${target.evidenceStatus}」，复测补证前不能签发。`
+      return
+    }
     selected = selected.includes(pointId) ? selected.filter((id) => id !== pointId) : [...selected, pointId]
   }
 
   function toggleSelectAll(): void {
-    selected = selected.length === rows.length ? [] : rows.map((row) => row.point.id)
+    const selectableIds = selectableRows.map((row) => row.point.id)
+    const allSelected = selectableIds.length > 0 && selectableIds.every((id) => selected.includes(id))
+    selected = allSelected ? [] : selectableIds
   }
 
   async function runAutoJudgeAll(): Promise<void> {
     const count = await autoJudgeAll(inspector)
-    notice = `已对 ${count} 个测点完成自动初判，请逐条由检测人确认生效。`
+    notice = `已对 ${count} 个未签发测点完成自动初判；已签发结论保持锁定不变，请逐条由检测人确认签发。`
   }
 
   async function runAutoJudge(pointId: string): Promise<void> {
     await autoJudgePoint(pointId, inspector)
-    notice = '已按实测值与限值比对给出初判，请确认生效。'
+    notice = '已按实测值与限值比对给出初判，请确认签发。'
   }
 
   async function confirmOne(row: (typeof rows)[number]): Promise<void> {
+    if (!row.issuable) {
+      notice = `测点 ${row.point.code} 证据「${row.evidenceStatus}」，不能签发：请先复测或补证。`
+      return
+    }
     if (!row.verdict) {
       await autoJudgePoint(row.point.id, inspector)
       const latest = $verdictRows.find((item) => item.point.id === row.point.id)
-      if (latest?.verdict) await confirmVerdict(latest.verdict.id, { inspector })
-      notice = `测点 ${row.point.code} 的判定已确认生效。`
+      if (latest?.verdict) {
+        const result = await confirmVerdict(latest.verdict.id, { inspector })
+        notice = result.ok
+          ? `测点 ${row.point.code} 的判定已签发，仪器编号与校准有效期已冻结为原始依据。`
+          : `签发失败：${result.reason}`
+      }
       return
     }
-    await confirmVerdict(row.verdict.id, { inspector })
-    notice = `测点 ${row.point.code} 的判定已确认生效。`
+    if (row.verdict.confirmed) {
+      notice = '该结论已签发并锁定，不能直接改动；如需变更请到测点页改值退回复测后重新签发。'
+      return
+    }
+    const result = await confirmVerdict(row.verdict.id, { inspector })
+    notice = result.ok
+      ? `测点 ${row.point.code} 的判定已签发，仪器编号与校准有效期已冻结为原始依据。`
+      : `签发失败：${result.reason}`
   }
 
   async function bulkSet(result: VerdictResult): Promise<void> {
     if (selected.length === 0) {
-      notice = '请先勾选要批量改判的测点。'
+      notice = '请先勾选要批量改判的未签发测点（已签发结论已锁定，不可勾选）。'
       return
     }
-    const count = await bulkSetVerdictResult(selected, result, bulkInspector)
-    notice = `已批量将 ${count} 个测点的判定结论改为「${result}」并确认生效。`
+    const outcome = await bulkSetVerdictResult(selected, result, bulkInspector)
+    notice =
+      `已批量改判并签发 ${outcome.changed} 个测点。` +
+      (outcome.skipped > 0 ? `跳过 ${outcome.skipped} 个：${outcome.skippedReasons.join('；')}` : '')
     selected = []
   }
 
@@ -277,7 +307,8 @@
     <div>
       <h2 class="page__title">合格判定与整改建议</h2>
       <p class="gb-hint">
-        实测值与限值比对自动给出初判，检测人确认后生效；不合格测点可一键批量生成整改建议，并跟踪整改状态机到复检闭环。
+        实测值与限值比对自动给出初判，检测人签发后结论锁定，原始依据（实测值、限值、仪器编号、当次校准有效期）冻结保存；
+        已签发结论不能直接改判，测点改值或校准更正会退回待复测 / 标记需补充，复测补证后重新签发。
       </p>
     </div>
     <div class="page__actions">
@@ -304,9 +335,20 @@
       suffix="点"
       tone={totals.unqualified > 0 ? 'danger' : 'success'}
     />
-    <StatBadge label="未确认" value={totals.unconfirmed} suffix="条" tone={totals.unconfirmed > 0 ? 'warning' : 'success'} />
+    <StatBadge label="未签发" value={totals.unconfirmed} suffix="条" tone={totals.unconfirmed > 0 ? 'warning' : 'success'} />
     <StatBadge label="整体合格率" value={$qualifyStats.overall.rate} percent={$qualifyStats.overall.rate} tone="success" />
-    <StatBadge label="初判不一致" value={totals.inconsistent} suffix="条" tone={totals.inconsistent > 0 ? 'warning' : 'default'} />
+    <StatBadge
+      label="待复测"
+      value={totals.retest}
+      suffix="点"
+      tone={totals.retest > 0 ? 'warning' : 'success'}
+    />
+    <StatBadge
+      label="需补充(已签发)"
+      value={totals.supplement}
+      suffix="点"
+      tone={totals.supplement > 0 ? 'danger' : 'success'}
+    />
   </div>
 
   <FilterBar
@@ -332,8 +374,8 @@
         <span>批量判定人</span>
         <input bind:value={bulkInspector} maxlength="20" />
       </label>
-      <button class="btn btn--small" type="button" onclick={() => bulkSet('合格')}>批量改合格</button>
-      <button class="btn btn--small" type="button" onclick={() => bulkSet('不合格')}>批量改不合格</button>
+      <button class="btn btn--small" type="button" onclick={() => bulkSet('合格')}>未签发行批量改合格</button>
+      <button class="btn btn--small" type="button" onclick={() => bulkSet('不合格')}>未签发行批量改不合格</button>
     {/snippet}
   </FilterBar>
 
@@ -356,23 +398,34 @@
         <thead>
           <tr>
             <th class="is-check">
-              <input type="checkbox" checked={selected.length === rows.length} onchange={toggleSelectAll} />
+              <input
+                type="checkbox"
+                checked={selectableRows.length > 0 && selectableRows.every((row) => selected.includes(row.point.id))}
+                onchange={toggleSelectAll}
+                title="只勾选未签发且证据有效的测点"
+              />
             </th>
             <th>测点</th>
             <th>建筑物 / 装置</th>
             <th class="is-num">实测（Ω）</th>
             <th class="is-num">限值（Ω）</th>
+            <th>证据状态</th>
             <th>自动初判</th>
-            <th>检测人结论</th>
-            <th>判定依据</th>
+            <th>检测人结论（已签发锁定）</th>
+            <th>签发时冻结的原始依据</th>
             <th>操作</th>
           </tr>
         </thead>
         <tbody>
           {#each rows as row (row.point.id)}
-            <tr class:is-bad={!row.qualified}>
+            <tr class:is-bad={!row.qualified} class:is-pending={row.evidenceStatus !== '有效'}>
               <td class="is-check">
-                <input type="checkbox" checked={selected.includes(row.point.id)} onchange={() => toggleSelect(row.point.id)} />
+                <input
+                  type="checkbox"
+                  checked={selected.includes(row.point.id)}
+                  disabled={Boolean(row.verdict?.confirmed) || !row.issuable}
+                  onchange={() => toggleSelect(row.point.id)}
+                />
               </td>
               <td>
                 <div class="gb-mono">{row.point.code}</div>
@@ -384,26 +437,61 @@
               </td>
               <td class="is-num gb-mono">{row.point.measuredOhm}</td>
               <td class="is-num gb-mono">{row.point.limitOhm}</td>
+              <td>
+                {#if row.evidenceStatus === '有效'}
+                  <span class="gb-tag">证据有效</span>
+                {:else}
+                  <span class="ev-tag ev-tag--{row.evidenceStatus}">{row.evidenceStatus}</span>
+                  {#if row.evidenceNote}
+                    <div class="gb-hint" title={row.evidenceNote}>{row.evidenceNote}</div>
+                  {/if}
+                {/if}
+              </td>
               <td><QualifyTag result={row.autoResult} size="small" plain /></td>
               <td>
                 {#if row.verdict}
                   <QualifyTag result={row.verdict.result} size="small" />
                   <div class="gb-hint">
-                    {row.verdict.confirmed ? '已确认生效' : '待检测人确认'} · {row.verdict.inspector || '未署名'}
+                    {row.verdict.confirmed ? `已签发锁定 · ${row.verdict.inspector || '未署名'}` : `待检测人签发 · ${row.verdict.inspector || '未署名'}`}
                   </div>
-                  {#if !row.consistent}
-                    <div class="gb-danger">与初判不一致</div>
+                  {#if row.reopened}
+                    <div class="gb-danger">已退回待复测，下方为原签发依据</div>
+                  {/if}
+                  {#if row.verdict.confirmed && !row.consistent}
+                    <div class="gb-danger">与初判不一致（以签发结论为准）</div>
                   {/if}
                 {:else}
                   <span class="gb-hint">尚未判定</span>
                 {/if}
               </td>
-              <td class="gb-hint">{row.verdict?.basis ?? '—'}</td>
+              <td class="gb-hint basis-cell">
+                {#if row.issued}
+                  <div title="结论签发时冻结，之后测点改值/仪器注销/校准更正均不改变此处">
+                    {row.issued.meterName || '—'}
+                    {#if row.issued.calibrationValidUntil}
+                      <div>校准至 {row.issued.calibrationValidUntil}</div>
+                    {/if}
+                    <div>原实测 {row.issued.measuredOhm} Ω / 限值 {row.issued.limitOhm} Ω · {row.issued.measureDate}</div>
+                  </div>
+                {:else}
+                  <span>—</span>
+                {/if}
+              </td>
               <td class="row-actions">
-                <button class="btn btn--small" type="button" onclick={() => runAutoJudge(row.point.id)}>初判</button>
-                <button class="btn btn--primary btn--small" type="button" onclick={() => confirmOne(row)}>
-                  {row.verdict?.confirmed ? '重新确认' : '确认生效'}
-                </button>
+                {#if !row.verdict?.confirmed}
+                  <button class="btn btn--small" type="button" onclick={() => runAutoJudge(row.point.id)}>初判</button>
+                  <button
+                    class="btn btn--primary btn--small"
+                    type="button"
+                    disabled={!row.issuable}
+                    title={row.issuable ? '' : row.evidenceStatus === '待复测' ? '请先在测点页完成复测' : '证据无效，需补证后复测'}
+                    onclick={() => confirmOne(row)}
+                  >
+                    签发
+                  </button>
+                {:else}
+                  <span class="gb-hint">已锁定，不可改判</span>
+                {/if}
               </td>
             </tr>
           {/each}
@@ -599,6 +687,42 @@
 
   tr.is-bad td {
     background: #fff6f4;
+  }
+
+  tr.is-pending td {
+    background: #fffdf4;
+  }
+
+  tr.is-bad.is-pending td {
+    background: #fef8f0;
+  }
+
+  .basis-cell {
+    max-width: 220px;
+  }
+
+  .ev-tag {
+    display: inline-block;
+    padding: 1px 10px;
+    border-radius: 999px;
+    font-size: 12px;
+    font-weight: 600;
+    white-space: nowrap;
+  }
+
+  .ev-tag--待复测 {
+    color: #9a6a00;
+    background: #fdf3d7;
+  }
+
+  .ev-tag--需补充 {
+    color: #b0561b;
+    background: #fdebdc;
+  }
+
+  .ev-tag--待补证 {
+    color: #c0392b;
+    background: #fdecea;
   }
 
   .template-row {

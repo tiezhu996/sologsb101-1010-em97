@@ -308,7 +308,7 @@
                             <th class="is-num">实测（Ω）</th>
                             <th class="is-num">限值（Ω）</th>
                             <th>判定</th>
-                            <th>检测仪器</th>
+                            <th>检测仪器（证据快照）</th>
                           </tr>
                         </thead>
                         <tbody>
@@ -319,7 +319,15 @@
                               <td class="is-num gb-mono">{point.measuredOhm}</td>
                               <td class="is-num gb-mono">{point.limitOhm}</td>
                               <td><QualifyTag measuredOhm={point.measuredOhm} limitOhm={point.limitOhm} size="small" /></td>
-                              <td class="gb-hint">{point.meter}</td>
+                              <td class="gb-hint">
+                                {point.evidence?.meterName || point.meter || '—'}
+                                {#if point.evidence?.calibrationValidUntil}
+                                  <div>校准至 {point.evidence.calibrationValidUntil}</div>
+                                {/if}
+                                {#if point.evidence && point.evidence.status !== '有效'}
+                                  <span class="gb-danger">证据{point.evidence.status}</span>
+                                {/if}
+                              </td>
                             </tr>
                           {/each}
                         </tbody>

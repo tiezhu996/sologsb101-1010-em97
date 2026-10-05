@@ -13,7 +13,8 @@
   import { currentPath } from '$lib/utils/query.ts'
   import { useRouter } from '$lib/utils/router.ts'
   import { buildingList, buildingReady, deviceList } from '$lib/stores/buildingStore.ts'
-  import { pointList } from '$lib/stores/pointStore.ts'
+  import { pointList, pendingEvidencePoints } from '$lib/stores/pointStore.ts'
+  import { instrumentList } from '$lib/stores/instrumentStore.ts'
   import { rectifyList } from '$lib/stores/rectifyStore.ts'
   import { DB_NAME, DB_VERSION } from '$lib/utils/db.ts'
   import { qualifyRate, isQualified } from '$lib/utils/resistance.ts'
@@ -28,6 +29,8 @@
   const unqualifiedCount = $derived($pointList.filter((point) => !isQualified(point.measuredOhm, point.limitOhm)).length)
   const rate = $derived(qualifyRate($pointList.map((point) => isQualified(point.measuredOhm, point.limitOhm))))
   const pendingRectify = $derived($rectifyList.filter((rectify) => rectify.state !== '已复检').length)
+  const inUseInstrumentCount = $derived($instrumentList.filter((instrument) => instrument.status === '在用').length)
+  const pendingEvidenceCount = $derived($pendingEvidencePoints.length)
 
   /** 导航高亮：根路径也算建筑物台账 */
   function isActive(path: string): boolean {
@@ -63,6 +66,8 @@
             <em class="app-nav__badge">{$buildingList.length}</em>
           {:else if item.path === '/devices'}
             <em class="app-nav__badge">{$deviceList.length}</em>
+          {:else if item.path === '/instruments'}
+            <em class="app-nav__badge">{inUseInstrumentCount}</em>
           {:else if item.path === '/points'}
             <em class="app-nav__badge">{pointCount}</em>
           {:else if item.path === '/verdicts'}
@@ -88,7 +93,7 @@
       本地库 {DB_NAME} · 结构版本 v{DB_VERSION} · 数据仅存于本浏览器 IndexedDB，不上传任何服务器。
     </span>
     <span>
-      建筑物 {$buildingList.length} · 装置 {$deviceList.length} · 测点 {pointCount} · 不合格 {unqualifiedCount} · 合格率 {rate}% · 未闭环整改 {pendingRectify}
+      建筑物 {$buildingList.length} · 装置 {$deviceList.length} · 仪器 {$instrumentList.length} · 测点 {pointCount} · 不合格 {unqualifiedCount} · 合格率 {rate}% · 待复测/补证 {pendingEvidenceCount} · 未闭环整改 {pendingRectify}
     </span>
   </footer>
 </div>

@@ -1,7 +1,7 @@
 /**
  * 路由表（history 模式）。
  *
- * 路径为真实地址：/buildings、/devices、/points、/verdicts、/backup，
+ * 路径为真实地址：/buildings、/devices、/instruments、/points、/verdicts、/backup，
  * location.hash 恒为空；深层链接刷新由 nginx `try_files $uri $uri/ /index.html` 兜底，
  * `vite preview` 同样内置 SPA fallback。
  *
@@ -14,6 +14,7 @@
 import type { Component } from 'svelte'
 import BuildingList from './BuildingList.svelte'
 import DeviceList from './DeviceList.svelte'
+import InstrumentLedger from './InstrumentLedger.svelte'
 import PointEntry from './PointEntry.svelte'
 import VerdictBoard from './VerdictBoard.svelte'
 import BackupView from './BackupView.svelte'
@@ -38,6 +39,7 @@ export const routes: AppRoute[] = [
   { path: '/', component: HomeRedirect as unknown as PageComponent },
   { path: HOME_PATH, component: BuildingList as unknown as PageComponent },
   { path: '/devices', component: DeviceList as unknown as PageComponent },
+  { path: '/instruments', component: InstrumentLedger as unknown as PageComponent },
   { path: '/points', component: PointEntry as unknown as PageComponent },
   { path: '/verdicts', component: VerdictBoard as unknown as PageComponent },
   { path: '/backup', component: BackupView as unknown as PageComponent },

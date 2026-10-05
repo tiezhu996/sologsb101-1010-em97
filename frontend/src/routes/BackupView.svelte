@@ -30,10 +30,9 @@
   } from '$lib/utils/export.ts'
   import type { ConclusionLine, CountMap } from '$lib/utils/export.ts'
   import { RECTIFY_STATES } from '$lib/types/rectify.ts'
+  import { EMPTY_COUNTS } from '$lib/utils/export.ts'
 
-  const EMPTY_COUNTS: CountMap = { buildings: 0, devices: 0, points: 0, verdicts: 0, rectifies: 0 }
-
-  let counts = $state<CountMap>(EMPTY_COUNTS)
+  let counts = $state<CountMap>({ ...EMPTY_COUNTS })
   let lastBackupAt = $state<string | null>(null)
   let stampedVersion = $state<number>(DB_VERSION)
   let conclusions = $state<ConclusionLine[]>([])
@@ -193,6 +192,7 @@
             <th class="is-num">装置</th>
             <th class="is-num">测点</th>
             <th class="is-num">不合格</th>
+            <th class="is-num">证据待处理</th>
             <th>检测结论</th>
             <th>最不利点</th>
             <th>整改建议</th>
@@ -200,7 +200,7 @@
         </thead>
         <tbody>
           {#each conclusions as line (line.buildingId)}
-            <tr class:is-bad={line.unqualifiedCount > 0}>
+            <tr class:is-bad={line.unqualifiedCount > 0 || line.pendingEvidenceCount > 0}>
               <td>{line.buildingName}</td>
               <td>
                 <span class="gb-tag">{line.protectionClass}</span>
@@ -209,6 +209,13 @@
               <td class="is-num gb-mono">{line.deviceCount}</td>
               <td class="is-num gb-mono">{line.pointCount}</td>
               <td class="is-num gb-mono">{line.unqualifiedCount}</td>
+              <td class="is-num gb-mono">
+                {#if line.pendingEvidenceCount > 0}
+                  <span class="gb-danger">{line.pendingEvidenceCount}</span>
+                {:else}
+                  0
+                {/if}
+              </td>
               <td>
                 <div>{line.conclusion}</div>
                 <div class="gb-hint">合格率 {line.qualifyRatePct}%</div>
@@ -239,6 +246,8 @@
             <th class="is-num">实测（Ω）</th>
             <th class="is-num">限值（Ω）</th>
             <th>判定</th>
+            <th>证据状态</th>
+            <th>仪器编号 / 校准有效期</th>
             <th>检测日期</th>
           </tr>
         </thead>
@@ -251,6 +260,19 @@
               <td class="is-num gb-mono">{row.point.measuredOhm}</td>
               <td class="is-num gb-mono">{row.point.limitOhm}</td>
               <td><QualifyTag measuredOhm={row.point.measuredOhm} limitOhm={row.point.limitOhm} size="small" /></td>
+              <td>
+                {#if row.point.evidence && row.point.evidence.status !== '有效'}
+                  <span class="gb-danger">{row.point.evidence.status}</span>
+                {:else}
+                  <span class="gb-tag">已固定</span>
+                {/if}
+              </td>
+              <td class="gb-hint">
+                {row.point.evidence?.meterId || '—'}
+                {#if row.point.evidence?.calibrationValidUntil}
+                  <div>校准至 {row.point.evidence.calibrationValidUntil}</div>
+                {/if}
+              </td>
               <td class="gb-mono">{row.point.measureDate}</td>
             </tr>
           {/each}
@@ -262,7 +284,7 @@
   <div class="gb-panel">
     <div class="gb-panel-title">
       <h3>全量 JSON 导入导出</h3>
-      <span class="gb-hint">导出内容包含 buildings / devices / points / verdicts / rectifies 五张表</span>
+      <span class="gb-hint">导出内容包含 buildings / devices / instruments / calibrations / points / verdicts / rectifies 七张表，证据状态随备份保留</span>
     </div>
     <div class="import-row">
       <label class="gb-field">
@@ -290,10 +312,10 @@
           <td class="gb-mono">{counts.points} / {counts.verdicts}</td>
         </tr>
         <tr>
+          <th>仪器 / 校准记录</th>
+          <td class="gb-mono">{counts.instruments} / {counts.calibrations}</td>
           <th>整改建议</th>
           <td class="gb-mono">{counts.rectifies}</td>
-          <th>最近备份时间</th>
-          <td>{lastBackupAt ? new Date(lastBackupAt).toLocaleString('zh-CN') : '尚未备份'}</td>
         </tr>
         <tr>
           <th>状态分布</th>
@@ -302,6 +324,10 @@
               <span class="gb-tag">{state} {$rectifyList.filter((item) => item.state === state).length}</span>
             {/each}
           </td>
+        </tr>
+        <tr>
+          <th>最近备份时间</th>
+          <td colspan="3">{lastBackupAt ? new Date(lastBackupAt).toLocaleString('zh-CN') : '尚未备份'}</td>
         </tr>
       </tbody>
     </table>
